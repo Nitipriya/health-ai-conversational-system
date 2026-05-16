@@ -1,357 +1,487 @@
 # Health AI Conversational System — API Specification
 
-This document details the REST API for the Health AI Conversational System. All endpoints are **versioned** under `/v1`.
+---
+
+## Overview
+
+- **Base path:** `/v1`
+- **Protocol:** HTTPS (HTTP in local dev)
+- **Auth:** Bearer JWT on all protected routes
+- **Content-Type:** `application/json` (except SSE endpoint)
+- **Errors:** Standard envelope on all 4xx/5xx
+- **Pagination:** Cursor-based on all list endpoints
 
 ---
 
-## 1. Base URL & Versioning
+## Versioning
 
-* **Base path:** `/v1` (e.g. `https://api.example.com/v1`).
-* **Versioning:** Path-based. Future breaking changes introduce `/v2`; `/v1` remains supported per deprecation policy.
-
----
-
-## 2. Authentication
-
-### 2.1 Register
-
-```http
-POST /v1/auth/register
-Content-Type: application/json
-```
-
-**Request body:**
-
-```json
-{
-  "email": "user@example.com",
-  "password": "securePassword123"
-}
-```
-
-**Responses:**
-
-* `201 Created` — User created; body may include `user_id`, `email` (no password).
-* `400 Bad Request` — Validation error (e.g. invalid email, weak password).
-* `409 Conflict` — Email already registered.
+All endpoints are prefixed with `/v1`. Future breaking changes introduce `/v2` without removing `/v1` until clients migrate.
 
 ---
 
-### 2.2 Login
+## Authentication
 
-```http
-POST /v1/auth/login
-Content-Type: application/json
-```
-
-**Request body:**
-
-```json
-{
-  "email": "user@example.com",
-  "password": "securePassword123"
-}
-```
-
-**Response (200 OK):**
-
-```json
-{
-  "access_token": "eyJ...",
-  "refresh_token": "rt_...",
-  "token_type": "Bearer",
-  "expires_in": 900
-}
-```
-
-* **Access token:** Short-lived (e.g. 15 minutes). Send in `Authorization: Bearer <access_token>`.
-* **Refresh token:** Long-lived, used only at `POST /v1/auth/refresh`. Store securely (e.g. httpOnly cookie or secure client storage). Rotate on use.
-
-**Error responses:**
-
-* `401 Unauthorized` — Invalid credentials.
+### Token Strategy
+- **Access token:** JWT, 15-minute TTL, sent as `Authorization: Bearer <token>`
+- **Refresh token:** Opaque token, 7-day TTL, stored in `httpOnly; Secure; SameSite=Strict` cookie
+- On access token expiry, client calls `POST /v1/auth/refresh` to get a new one silently
 
 ---
 
-### 2.3 Refresh Token
+## Error Format
 
-```http
-POST /v1/auth/refresh
-Content-Type: application/json
-```
-
-**Request body:**
-
-```json
-{
-  "refresh_token": "rt_..."
-}
-```
-
-**Response (200 OK):** Same shape as login (`access_token`, optional new `refresh_token`, `expires_in`).
-
-**Error responses:**
-
-* `401 Unauthorized` — Invalid or revoked refresh token.
-
----
-
-### 2.4 Protected Endpoints
-
-All chat and message endpoints require:
-
-```http
-Authorization: Bearer <access_token>
-```
-
-* `401 Unauthorized` — Missing or invalid/expired access token.
-* `403 Forbidden` — Valid token but not allowed to access the resource (e.g. another user's chat).
-
----
-
-## 3. Error Format
-
-All error responses use a **standard envelope**:
+All errors use this envelope:
 
 ```json
 {
   "error": {
-    "code": "RATE_LIMIT_EXCEEDED",
-    "message": "Too many requests. Retry after 60 seconds.",
-    "details": {
-      "retry_after": 60
-    }
+    "code": "string",
+    "message": "string",
+    "details": {}
   }
 }
 ```
 
-**Common HTTP status codes:**
-
-| Status | Usage |
-|--------|--------|
-| 400 | Bad Request — validation, malformed body |
-| 401 | Unauthorized — missing/invalid token |
-| 403 | Forbidden — no access to resource |
-| 404 | Not Found — chat or resource missing |
-| 409 | Conflict — e.g. idempotency key duplicate (return existing response) |
-| 429 | Too Many Requests — rate limit exceeded |
-| 503 | Service Unavailable — model or safety service down |
-
-**Error codes (examples):** `VALIDATION_ERROR`, `UNAUTHORIZED`, `FORBIDDEN`, `NOT_FOUND`, `RATE_LIMIT_EXCEEDED`, `SERVICE_UNAVAILABLE`, `SAFETY_OVERRIDE` (when a safe template was returned).
+### Common Error Codes
+| HTTP | code | Meaning |
+|---|---|---|
+| 400 | `validation_error` | Invalid request body or params |
+| 401 | `unauthorized` | Missing or invalid access token |
+| 403 | `forbidden` | Authenticated but not allowed (e.g. wrong user's chat) |
+| 403 | `consent_required` | User has not completed consent gate |
+| 404 | `not_found` | Resource does not exist |
+| 409 | `conflict` | Duplicate idempotency key with different body |
+| 422 | `unprocessable` | Semantically invalid input |
+| 429 | `rate_limited` | Too many requests |
+| 503 | `service_unavailable` | Ollama or DB not reachable |
 
 ---
 
-## 4. Pagination
+## Pagination
 
-List endpoints support **cursor-based** or **offset-based** pagination. Same pattern for `GET /v1/chats` and `GET /v1/chats/{chat_id}/messages`.
+All list endpoints use cursor-based pagination.
 
-### Query parameters
+**Query params:** `cursor` (opaque string), `limit` (int, default 20, max 50)
 
-| Parameter | Type   | Default | Description |
-|-----------|--------|--------|-------------|
-| `limit`  | integer | 20     | Page size (max 50) |
-| `cursor` | string  | —      | Opaque cursor for next page (from previous response) |
-
-**Example (cursor-based):**
-
-```http
-GET /v1/chats?limit=20
-GET /v1/chats?limit=20&cursor=eyJ...
-```
-
-**Response shape (list):**
-
+**Response envelope:**
 ```json
 {
-  "data": [ ... ],
-  "next_cursor": "eyJ..." | null,
-  "has_more": true
+  "data": [...],
+  "next_cursor": "string | null",
+  "limit": 20
 }
 ```
 
-If **offset-based** is used instead:
-
-* Params: `limit` (max 50), `offset` (default 0).
-* Response: `data`, `total` (optional), `limit`, `offset`.
+`next_cursor: null` means no more pages.
 
 ---
 
-## 5. Rate Limiting
+## Endpoints
 
-* **Scope:** Per user (by `user_id` from JWT). Optionally also per IP for unauthenticated or auth endpoints.
-* **Limits:** e.g. 60 requests/minute per user for chat/message endpoints; stricter for auth if needed.
-* **Response when exceeded:** `429 Too Many Requests` with standard error body and `Retry-After` header (seconds).
+---
 
-Example error:
+### Auth
 
+#### `POST /v1/auth/register`
+
+Register a new user.
+
+**Request:**
 ```json
 {
-  "error": {
-    "code": "RATE_LIMIT_EXCEEDED",
-    "message": "Too many requests. Retry after 60 seconds.",
-    "details": { "retry_after": 60 }
-  }
+  "email": "user@example.com",
+  "password": "string (min 8 chars)"
 }
 ```
 
----
-
-## 6. Health & Readiness
-
-```http
-GET /health
-```
-
-* **200 OK** — Service is alive (liveness).
-
-```http
-GET /ready
-```
-
-* **200 OK** — Service is ready to accept traffic (e.g. DB and critical dependencies up).
-* **503 Service Unavailable** — Not ready (e.g. DB down).
-
-These endpoints are **unversioned** and typically **unauthenticated**.
-
----
-
-## 7. Chat Endpoints
-
-### 7.1 Create chat
-
-```http
-POST /v1/chats
-Authorization: Bearer <access_token>
-Content-Type: application/json
-```
-
-**Request body (optional):**
-
+**Response `201`:**
 ```json
 {
-  "title": "My first chat"
+  "user_id": "uuid",
+  "email": "user@example.com",
+  "access_token": "string"
+}
+```
+Sets `httpOnly` refresh cookie.
+
+**Errors:** `400` validation, `409` email already registered
+
+---
+
+#### `POST /v1/auth/login`
+
+**Request:**
+```json
+{
+  "email": "user@example.com",
+  "password": "string"
 }
 ```
 
-**Response (201 Created):**
+**Response `200`:**
+```json
+{
+  "user_id": "uuid",
+  "access_token": "string"
+}
+```
+Sets `httpOnly` refresh cookie.
 
+**Errors:** `401` invalid credentials
+
+---
+
+#### `POST /v1/auth/refresh`
+
+Exchange refresh cookie for a new access token. No request body needed.
+
+**Response `200`:**
+```json
+{
+  "access_token": "string"
+}
+```
+
+**Errors:** `401` missing or expired refresh cookie
+
+---
+
+#### `POST /v1/auth/logout`
+
+Clears the refresh cookie. No request body.
+
+**Response `204`** — no content
+
+---
+
+### Users
+
+#### `POST /v1/users/consent`  🔒 auth required
+
+Record that the authenticated user has accepted the terms of use. Must be called before the first chat is created. Returns `403 consent_required` on chat/message endpoints until this is done.
+
+**Request:**
+```json
+{
+  "accepted": true
+}
+```
+
+**Response `200`:**
+```json
+{
+  "consent_given": true,
+  "consent_at": "2025-05-17T10:00:00Z"
+}
+```
+
+**Errors:** `400` if `accepted` is false
+
+---
+
+### Chats
+
+All chat endpoints require auth. Users can only access their own chats.
+
+#### `POST /v1/chats`  🔒
+
+Create a new chat. Title is auto-generated from the first message later; placeholder used until then.
+
+**Request:** _(empty body or optional title)_
+```json
+{
+  "title": "string (optional)"
+}
+```
+
+**Response `201`:**
 ```json
 {
   "id": "uuid",
-  "user_id": "uuid",
-  "title": "My first chat",
-  "created_at": "2025-02-07T12:00:00Z",
-  "expires_at": "2025-05-08T12:00:00Z"
+  "title": "New chat",
+  "created_at": "ISO8601",
+  "expires_at": "ISO8601"
 }
 ```
 
----
-
-### 7.2 List chats
-
-```http
-GET /v1/chats?limit=20&cursor=...
-Authorization: Bearer <access_token>
-```
-
-* Returns only chats for the authenticated user, **excluding** soft-deleted (`is_deleted = true`).
-* Ordered by `created_at` descending.
-* Paginated per §4.
+**Errors:** `403 consent_required` if user has not consented
 
 ---
 
-### 7.3 Get chat
+#### `GET /v1/chats`  🔒
 
-```http
-GET /v1/chats/{chat_id}
-Authorization: Bearer <access_token>
-```
+List current user's chats, newest first.
 
-**Response (200 OK):** Single chat object. **404** if not found or not owned by user.
+**Query params:** `cursor`, `limit`
 
----
-
-### 7.4 Send message (idempotent)
-
-```http
-POST /v1/chats/{chat_id}/message
-Authorization: Bearer <access_token>
-Idempotency-Key: <opaque_key>
-Content-Type: application/json
-```
-
-**Request body:**
-
+**Response `200`:**
 ```json
 {
-  "content": "I have had a mild fever for 2 days."
+  "data": [
+    {
+      "id": "uuid",
+      "title": "string",
+      "created_at": "ISO8601",
+      "expires_at": "ISO8601"
+    }
+  ],
+  "next_cursor": "string | null",
+  "limit": 20
 }
 ```
 
-* **Idempotency-Key:** Optional. If provided and a message with the same key already exists for this chat, return **200** with the **existing** assistant response (no new model call).
-* **Response (200 OK):** Assistant reply, e.g.:
+---
 
+#### `GET /v1/chats/{chat_id}`  🔒
+
+**Response `200`:**
+```json
+{
+  "id": "uuid",
+  "title": "string",
+  "created_at": "ISO8601",
+  "expires_at": "ISO8601"
+}
+```
+
+**Errors:** `403` wrong user, `404` not found
+
+---
+
+#### `PATCH /v1/chats/{chat_id}`  🔒
+
+Rename a chat.
+
+**Request:**
+```json
+{
+  "title": "string"
+}
+```
+
+**Response `200`:**
+```json
+{
+  "id": "uuid",
+  "title": "string"
+}
+```
+
+---
+
+#### `DELETE /v1/chats/{chat_id}`  🔒
+
+Soft-deletes the chat and all its messages.
+
+**Response `204`** — no content
+
+---
+
+### Messages
+
+#### `POST /v1/chats/{chat_id}/message`  🔒
+
+Send a message and receive the full AI response (non-streaming).
+
+**Headers:**
+- `Idempotency-Key: <uuid>` (optional) — prevents duplicate model calls on retry
+
+**Request:**
+```json
+{
+  "content": "string (max 1000 chars)"
+}
+```
+
+**Response `200`:**
 ```json
 {
   "message_id": "uuid",
   "role": "assistant",
-  "content": "...",
-  "created_at": "2025-02-07T12:01:00Z"
+  "content": "string",
+  "disclaimer": "This is for informational purposes only. Please consult a healthcare professional.",
+  "confidence": "low | medium | high",
+  "safety_overridden": false,
+  "created_at": "ISO8601"
 }
 ```
 
-**Errors:**
+If `safety_overridden: true`, `confidence` is omitted and `content` is a canned safe response.
 
-* **404** — Chat not found or not owned.
-* **429** — Rate limited.
-* **503** — Model or safety service unavailable (user sees safe fallback message).
+**Errors:** `400` content too long, `403` wrong user / consent required, `429` rate limited, `503` Ollama unavailable
 
 ---
 
-### 7.5 List messages
+#### `GET /v1/chats/{chat_id}/stream`  🔒
 
-```http
-GET /v1/chats/{chat_id}/messages?limit=50&cursor=...
-Authorization: Bearer <access_token>
+Stream the AI response token by token via SSE.
+
+**Query params:**
+- `message` — URL-encoded message content (max 1000 chars)
+- `idempotency_key` — optional
+
+**Response:** `Content-Type: text/event-stream`
+
+```
+data: {"token": "Based"}
+
+data: {"token": " on"}
+
+data: {"token": " your"}
+
+data: {"token": " symptoms"}
+
+data: [DONE]
 ```
 
-* Returns messages for the chat in **chronological order**.
-* Exclude messages with `is_deleted = true` if soft delete is implemented.
-* Paginated per §4; **max page size** 50.
+On safety override:
+```
+data: {"safety_overridden": true, "content": "Please contact emergency services immediately."}
 
----
-
-### 7.6 Delete chat
-
-```http
-DELETE /v1/chats/{chat_id}
-Authorization: Bearer <access_token>
+data: [DONE]
 ```
 
-* Soft delete: set `is_deleted = true` (or equivalent). **204 No Content** on success. **404** if not found or not owned.
+On error mid-stream:
+```
+data: {"error": "service_unavailable"}
+
+data: [DONE]
+```
+
+**Errors (before stream starts):** `400`, `403`, `429`, `503` — standard JSON error envelope
 
 ---
 
-## 8. Admin API (Optional)
+#### `GET /v1/chats/{chat_id}/messages`  🔒
 
-* **Scope:** Read-only or tightly scoped actions for support/compliance.
-* **Auth:** Separate admin role; admin JWT or API key.
-* **Examples:** `GET /v1/admin/safety-events`, export for audit. Not exposed to normal users.
+Paginated message history for a chat, oldest first.
+
+**Query params:** `cursor`, `limit`
+
+**Response `200`:**
+```json
+{
+  "data": [
+    {
+      "id": "uuid",
+      "role": "user | assistant",
+      "content": "string",
+      "disclaimer": "string | null",
+      "confidence": "low | medium | high | null",
+      "safety_overridden": false,
+      "created_at": "ISO8601"
+    }
+  ],
+  "next_cursor": "string | null",
+  "limit": 50
+}
+```
 
 ---
 
-## 9. Summary Table
+### Feedback
 
-| Method | Path | Auth | Pagination | Idempotency | Rate limit |
-|--------|------|------|------------|-------------|------------|
-| POST   | /v1/auth/register | — | — | — | Optional |
-| POST   | /v1/auth/login    | — | — | — | Optional |
-| POST   | /v1/auth/refresh  | — | — | — | Optional |
-| GET    | /health           | — | — | — | — |
-| GET    | /ready            | — | — | — | — |
-| POST   | /v1/chats         | JWT | — | — | Yes |
-| GET    | /v1/chats         | JWT | Yes (cursor, max 50) | — | Yes |
-| GET    | /v1/chats/{id}    | JWT | — | — | Yes |
-| POST   | /v1/chats/{id}/message | JWT | — | Idempotency-Key | Yes |
-| GET    | /v1/chats/{id}/messages | JWT | Yes (cursor, max 50) | — | Yes |
-| DELETE | /v1/chats/{id}    | JWT | — | — | Yes |
+#### `POST /v1/messages/{message_id}/feedback`  🔒
+
+Submit thumbs up/down on an assistant message. Only valid for `role: assistant` messages belonging to the authenticated user's chats.
+
+**Request:**
+```json
+{
+  "rating": 1,
+  "note": "string (optional)"
+}
+```
+`rating`: `1` = thumbs up, `-1` = thumbs down
+
+**Response `201`:**
+```json
+{
+  "id": "uuid",
+  "message_id": "uuid",
+  "rating": 1,
+  "created_at": "ISO8601"
+}
+```
+
+**Errors:** `400` invalid rating, `403` not user's message, `404` message not found, `409` feedback already submitted for this message
+
+---
+
+### Ops
+
+#### `GET /health`
+
+Always returns 200 if the process is alive. No auth required.
+
+**Response `200`:**
+```json
+{
+  "status": "ok"
+}
+```
+
+---
+
+#### `GET /ready`
+
+Checks DB and Ollama connectivity. No auth required.
+
+**Response `200`:**
+```json
+{
+  "status": "ready",
+  "db": "ok",
+  "ollama": "ok"
+}
+```
+
+**Response `503`:**
+```json
+{
+  "status": "not_ready",
+  "db": "ok",
+  "ollama": "error"
+}
+```
+
+---
+
+## Rate Limits
+
+| Endpoint | Limit | Response on exceed |
+|---|---|---|
+| `POST /v1/auth/register` | 10 req/min per IP | `429` |
+| `POST /v1/auth/login` | 10 req/min per IP | `429` |
+| `POST /v1/chats/{id}/message` | 20 req/min per user | `429` |
+| `GET /v1/chats/{id}/stream` | 20 req/min per user | `429` |
+| All other endpoints | 60 req/min per user | `429` |
+
+`429` response includes:
+```json
+{
+  "error": {
+    "code": "rate_limited",
+    "message": "Too many requests. Please slow down.",
+    "details": { "retry_after_seconds": 30 }
+  }
+}
+```
+
+---
+
+## Ollama Availability
+
+If Ollama is unreachable when a message is sent:
+- Return `503 service_unavailable`
+- Do **not** store the user's message
+- Log a `safety_events` record with `event_type: "model_unavailable"`
+- Client should retry after `GET /ready` returns `"ollama": "ok"`
+
+---
+
+## Changelog
+
+| Version | Change |
+|---|---|
+| v1.0 | Initial spec — auth, chats, messages, SSE streaming, feedback, ops |

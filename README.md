@@ -1,31 +1,35 @@
 # Health AI Conversational System
 
-A **design-first, production-grade** architecture for a privacy-preserving Health AI conversational system.  
-The system uses **Retrieval-Augmented Thought (RAT)** to enable safe reasoning without exposing chain-of-thought.
+A **design-first, privacy-preserving** Health AI conversational system.  
+Uses **Retrieval-Augmented Thought (RAT)** with a **local LLM via Ollama** — no data ever leaves your machine.
 
-> **Status:** Architecture & Design Phase
+> **Status:** Architecture & Design Complete — Backend Implementation In Progress
 
 ---
 
-## What This Repo Is
+## Why Local LLM?
 
-* **Reference architecture** for building safe, multi-user Health AI chat systems.
-* **Build-ready design** — database schema, API spec, context strategy, safety flows, and risk analysis.
-* **Demonstration** of AI systems thinking and safety-aware design.
-
-This repository is currently in the **architecture and design phase**. Implementation follows the roadmap in the architecture document.
+Running inference locally via Ollama means:
+- **Zero cost** — no API fees, no rate limits from a provider
+- **Maximum privacy** — patient health queries never touch an external server
+- **HIPAA/GDPR alignment by default** — no third-party data processor for the AI layer
+- **Works offline** — no dependency on external API availability
 
 ---
 
 ## Key Design Choices
 
 | Concern | Approach |
-|--------|----------|
-| **Privacy** | Summarized context only; no full chat history or chain-of-thought stored or sent to the model. |
-| **Safety** | Layered safety classifier; emergency path and escalation; medication rule (no specific dosage). |
-| **Reasoning** | RAT: internal reasoning hidden; only final, cautious answers exposed. |
-| **APIs** | Stateless, JWT + refresh tokens, versioned (`/v1`), paginated, rate-limited, standard errors. |
-| **Compliance** | Data minimization, retention/expiry, audit logging; HIPAA/GDPR alignment in roadmap. |
+|---|---|
+| **AI Model** | Local Ollama (`llama3.2` or `mistral`) — no external API |
+| **Privacy** | Summarized context only; no full history or chain-of-thought sent to model |
+| **Safety** | Layered safety classifier; emergency path, escalation, medication hard rule |
+| **Reasoning** | RAT: internal reasoning hidden; only final cautious answers exposed |
+| **Streaming** | SSE (Server-Sent Events) for real-time response streaming |
+| **APIs** | Stateless, JWT + httpOnly refresh cookie, versioned (`/v1`), cursor-paginated, rate-limited |
+| **Compliance** | Data minimization, retention/expiry, audit logging; HIPAA/GDPR alignment |
+| **Consent** | Explicit user consent gate before first chat (DB-tracked) |
+| **Feedback** | Thumbs up/down on every assistant message for quality tracking |
 
 ---
 
@@ -33,22 +37,66 @@ This repository is currently in the **architecture and design phase**. Implement
 
 ```
 docs/
-  ARCHITECTURE.md   # Full system design, DB schema, safety, context, RAT, compliance, roadmap
-  API_SPEC.md       # REST API: versioning, auth, errors, pagination, rate limits, endpoints
-README.md           # This file
+  ARCHITECTURE.md    # Full system design, DB schema, safety, RAT, compliance, roadmap
+  API_SPEC.md        # REST API: versioning, auth, errors, pagination, rate limits, endpoints
+README.md            # This file
 ```
 
 ---
 
-## Quick Links
+## Recommended Ollama Models
 
-* **[Architecture & design](docs/ARCHITECTURE.md)** — System overview, database design, context management, safety layer, RAT design, compliance, risk analysis, implementation roadmap.
-* **[API specification](docs/API_SPEC.md)** — Endpoints, authentication, error format, pagination, rate limiting, health checks.
+| Model | RAM needed | Best for |
+|---|---|---|
+| `llama3.2:3b` | ~4 GB | Fast responses, low-resource machines |
+| `llama3.1:8b` | ~8 GB | Better reasoning quality |
+| `mistral:7b` | ~8 GB | Strong instruction-following |
+| `gemma2:9b` | ~10 GB | Good balance of safety + quality |
+
+Start with `llama3.2:3b` for dev. Switch to `llama3.1:8b` or `mistral:7b` for better health response quality.
+
+Pull a model:
+```bash
+ollama pull llama3.2:3b
+```
+
+---
+
+## Tech Stack
+
+| Layer | Technology |
+|---|---|
+| Backend | FastAPI (Python 3.11+) |
+| Database | PostgreSQL |
+| ORM + Migrations | SQLAlchemy (async) + Alembic |
+| Auth | JWT (access) + httpOnly cookie (refresh) |
+| AI Inference | Ollama (local) |
+| Streaming | Server-Sent Events (SSE) |
+| Frontend | React via Loveable (Phase 4) |
+| Deployment | Railway / Render (Phase 2+) |
 
 ---
 
 ## Non-Goals
 
-* Medical diagnosis or treatment.
-* Replacing healthcare professionals.
-* Storing or exposing chain-of-thought or raw retrieved documents.
+- Medical diagnosis or treatment
+- Replacing healthcare professionals
+- Storing or exposing chain-of-thought or raw retrieved documents
+- Sending health data to any external AI provider
+
+---
+
+## Implementation Phases
+
+| Phase | Scope | Status |
+|---|---|---|
+| 1 | Architecture & Design | ✅ Complete |
+| 2 | Backend (Auth, Chat, Message, Safety, RAT) | 🔧 In Progress |
+| 3 | AI Layer Hardening (real classifier, red-team, evals) | ⬜ Planned |
+| 4 | Frontend via Loveable | ⬜ Planned |
+
+---
+
+## About
+
+Design-first, privacy-preserving Health AI conversational system using Retrieval-Augmented Thought (RAT) and local LLM inference via Ollama.

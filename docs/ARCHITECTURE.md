@@ -1,513 +1,524 @@
-# Health AI Conversational System (RAT-Based)
-
-## Architecture & Design Report
+# Health AI Conversational System — Architecture & Design
 
 ---
 
 ## 1. Project Overview
 
-### Title
-
-**Health AI Conversational System**
-
 ### Motivation
 
-Health-related conversational AI systems pose unique challenges around **safety**, **privacy**, **hallucination control**, and **explainability**. Traditional chat-based LLM systems often rely on replaying full chat history or Retrieval-Augmented Generation (RAG), which can inadvertently expose sensitive data or internal reasoning.
+Health-related conversational AI poses unique challenges around safety, privacy, hallucination control, and explainability. Traditional chat-based LLM systems often rely on full chat history replay or cloud-based RAG, which exposes sensitive data and incurs ongoing API costs.
 
-This project proposes a **design-first, production-grade architecture** for a Health AI chat system that:
-
-* Supports **multiple users and chats**
-* Maintains **persistent context safely**
-* Uses **RAT** to prevent chain-of-thought leakage
-* Is suitable for **regulated domains** such as healthcare
-
-The focus of this work is **system design, AI safety, and architectural rigor**, rather than implementation.
-
----
-
-## 2. Project Status & Scope
-
-### Current Status
-
-This project is currently in the **architecture and design phase**.
-
-Deliverables include:
-
-* System architecture
-* Database schema
-* API specifications
-* Context handling strategy
-* Safety and risk analysis
-* Sample prompts and workflows
-
-The design is **build-ready** and intended for future implementation.
+This project proposes a **design-first, production-grade architecture** that:
+- Supports multiple users and chats
+- Maintains persistent context safely using summarized memory
+- Uses **Retrieval-Augmented Thought (RAT)** to prevent chain-of-thought leakage
+- Runs entirely on a **local LLM via Ollama** — no health data leaves the machine
+- Is suitable for regulated domains (healthcare) and student/hobbyist budgets alike
 
 ### Non-Goals
-
-* Medical diagnosis or treatment
-* Replacing healthcare professionals
-* Storing or exposing chain-of-thought
-* Using full conversation replay as context
+- Medical diagnosis or treatment
+- Replacing healthcare professionals
+- Storing or exposing chain-of-thought
+- Sending patient data to any external AI provider
 
 ---
 
-## 3. High-Level System Architecture
-
-### Architectural Overview
+## 2. High-Level System Architecture
 
 ```
-Frontend (React)
-   ↓ JWT
+Frontend (React via Loveable)
+        ↓ JWT Bearer token
 API Gateway (FastAPI)
-   ↓
+        ↓
 Authentication & Authorization
-   ↓
+        ↓
+Consent Check (gate — first chat only)
+        ↓
 Safety & Policy Engine
-   ↓
-Context Builder (Summarized Memory)
-   ↓
-RAT Reasoner (Hidden)
-   ↓
-Response Generator
-   ↓
-Metrics & Audit Logs
+   ↓ flagged           ↓ allowed
+Canned Response    Context Builder (Summarized Memory)
+  + log event              ↓
+                     RAT Reasoner (Hidden)
+                           ↓ Ollama HTTP API (local)
+                     Response Generator
+                           ↓
+                     Structured Output Parser
+                           ↓
+                     Metrics & Audit Logs
 ```
 
 ### Key Principles
-
-* **Stateless APIs** using JWT authentication
-* **Minimal data exposure** to LLMs
-* **Layered safety checks** before reasoning
-* **Strict separation** between user-visible output and internal reasoning
+- **Stateless APIs** — JWT authentication, no server-side session
+- **Minimal data exposure** — summarized context only, never full history, never raw CoT
+- **Layered safety checks** before any model call
+- **Strict separation** between user-visible output and internal reasoning
+- **Local inference** — Ollama runs on the same machine or local network
 
 ### Operational Endpoints
+- `GET /health` — liveness probe
+- `GET /ready` — readiness probe (checks DB connection)
 
-* **Health check**: `GET /health` — liveness for load balancers and orchestrators.
-* **Readiness**: `GET /ready` — checks DB and critical dependencies (optional); used by Kubernetes or similar for traffic routing.
+---
+
+## 3. Local LLM — Ollama Integration
+
+### Why Ollama
+Ollama provides a simple HTTP API over locally-running open-source models. It is free, runs offline, and means no health query data is ever sent to a third-party AI provider — a significant privacy and compliance advantage.
+
+### Recommended Models
+
+| Model | RAM | Recommended for |
+|---|---|---|
+| `llama3.2:3b` | ~4 GB | Development / low-resource machines |
+| `llama3.1:8b` | ~8 GB | Better reasoning; preferred for production |
+| `mistral:7b` | ~8 GB | Strong instruction-following |
+| `gemma2:9b` | ~10 GB | Good safety + quality balance |
+
+Use `llama3.2:3b` during development. Switch to `llama3.1:8b` or `mistral:7b` once the stack is stable.
+
+### Ollama API Usage
+```
+Base URL:  http://localhost:11434
+Endpoint:  POST /api/chat          ← multi-turn, structured messages
+           POST /api/generate      ← single prompt
+Streaming: stream=true → NDJSON chunks
+```
+
+Example request to Ollama:
+```json
+POST http://localhost:11434/api/chat
+{
+  "model": "llama3.2:3b",
+  "stream": false,
+  "messages": [
+    { "role": "system", "content": "..." },
+    { "role": "user",   "content": "..." }
+  ]
+}
+```
+
+### Model Config (env-driven, hot-swappable)
+```
+OLLAMA_BASE_URL=http://localhost:11434
+OLLAMA_MODEL=llama3.2:3b
+OLLAMA_TIMEOUT_SECONDS=30
+OLLAMA_MAX_TOKENS=512
+```
+Changing `OLLAMA_MODEL` in `.env` swaps the model without a code change.
 
 ---
 
 ## 4. Database Design
 
-### Entity Relationship Overview
-
+### Entity Relationship
 ```
 User → Chat → Messages
-          ↓
-     Chat Context
+                 ↓
+            Chat Context
+                 ↓
+          Message Feedback
 ```
 
-### 4.1 Users Table
-
+### 4.1 Users
 ```sql
 users
-------
-id (UUID, PK)
-email (unique)
-password_hash
-created_at
+-----
+id              UUID        PRIMARY KEY
+email           TEXT        UNIQUE NOT NULL
+password_hash   TEXT        NOT NULL
+consent_given   BOOLEAN     DEFAULT false
+consent_at      TIMESTAMPTZ
+created_at      TIMESTAMPTZ DEFAULT now()
 ```
 
-### 4.2 Chats Table
-
+### 4.2 Chats
 ```sql
 chats
-------
-id (UUID, PK)
-user_id (FK → users.id)
-title
-created_at
-expires_at
-is_deleted
+-----
+id          UUID        PRIMARY KEY
+user_id     UUID        REFERENCES users(id)
+title       TEXT        -- auto-generated from first message; user-editable
+created_at  TIMESTAMPTZ DEFAULT now()
+expires_at  TIMESTAMPTZ -- retention policy (90 days from created_at)
+is_deleted  BOOLEAN     DEFAULT false
+
+INDEX: (user_id, created_at DESC)
 ```
 
-**Indexes:**
-
-* `chats(user_id, created_at DESC)` — list user's chats in reverse chronological order.
-
-### 4.3 Messages Table
-
+### 4.3 Messages
 ```sql
 messages
----------
-id (UUID, PK)
-chat_id (FK → chats.id)
-role (user | assistant)
-content
-created_at
-idempotency_key (unique, nullable)  -- client-supplied for POST /message
-is_deleted (boolean, default false) -- soft delete for "delete my last message"
+--------
+id               UUID        PRIMARY KEY
+chat_id          UUID        REFERENCES chats(id)
+role             TEXT        CHECK (role IN ('user', 'assistant'))
+content          TEXT        NOT NULL
+created_at       TIMESTAMPTZ DEFAULT now()
+idempotency_key  TEXT        UNIQUE  -- nullable; client-supplied on POST /message
+is_deleted       BOOLEAN     DEFAULT false
+
+INDEX: (chat_id, created_at)
 ```
 
-**Important Constraints:**
+Only final assistant responses are stored. No internal reasoning, no retrieved documents.
 
-* Only **final assistant responses** are stored.
-* No internal reasoning or retrieved documents are persisted.
+**Idempotency:** Client sends `Idempotency-Key` header on `POST /message`. If key exists for that `chat_id`, return the existing response instead of calling the model again.
 
-**Indexes:**
+### 4.4 Message Feedback
+```sql
+message_feedback
+----------------
+id          UUID        PRIMARY KEY
+message_id  UUID        REFERENCES messages(id)  -- assistant messages only
+rating      SMALLINT    CHECK (rating IN (-1, 1))  -- -1 = thumbs down, 1 = thumbs up
+note        TEXT        -- optional free-text from user
+created_at  TIMESTAMPTZ DEFAULT now()
 
-* `messages(chat_id, created_at)` — load messages for a chat in order.
+INDEX: (message_id)
+```
 
-**Idempotency:** For `POST /chats/{chat_id}/message`, the client may send an `Idempotency-Key` header. Store it in `messages.idempotency_key`; if a duplicate key is seen for the same `chat_id`, return the existing response instead of creating a new message.
-
-### 4.4 Chat Context Table
-
+### 4.5 Chat Context
 ```sql
 chat_context
 ------------
-chat_id (FK, unique)
-medical_facts_summary
-user_preferences_summary
-risk_flags
-version (integer, default 1)   -- for drift detection and re-summarization
-updated_at
+chat_id                  UUID    PRIMARY KEY REFERENCES chats(id)
+medical_facts_summary    TEXT
+user_preferences_summary TEXT
+risk_flags               TEXT[]
+version                  INTEGER DEFAULT 1
+updated_at               TIMESTAMPTZ
 ```
 
-**Versioning:** Use `version` (or `updated_at` + optional checksum) to detect context drift. When drift is detected or after a defined interval, trigger re-summarization from the last N messages.
-
-### 4.5 Safety Events Table
-
+### 4.6 Safety Events
 ```sql
 safety_events
 -------------
-id (UUID, PK)
-chat_id (FK)
-event_type
-severity
-escalation_status (none | internal_alert | external_referral)
-handled_at
+id                UUID        PRIMARY KEY
+chat_id           UUID        REFERENCES chats(id)
+event_type        TEXT        -- e.g. "emergency", "self_harm", "dosage_request", "classifier_error"
+severity          TEXT        -- "low" | "medium" | "high" | "critical"
+escalation_status TEXT        CHECK (escalation_status IN ('none','internal_alert','external_referral'))
+handled_at        TIMESTAMPTZ DEFAULT now()
+
+INDEX: (chat_id, handled_at)
+INDEX: (event_type, severity)
 ```
 
-**Indexes:**
-
-* `safety_events(chat_id, handled_at)` — per-chat audit.
-* `safety_events(event_type, severity)` — optional, for analytics and alerting.
-
-### 4.6 Model Metrics Table
-
+### 4.7 Model Metrics
 ```sql
 model_metrics
 -------------
-id (UUID, PK)
-date (date)
-metric_name
-value
-model_version        -- e.g. RAT model version
-safety_version       -- e.g. safety classifier version
+id              UUID    PRIMARY KEY
+date            DATE
+metric_name     TEXT    -- e.g. "safety_override_rate", "avg_response_tokens"
+value           NUMERIC
+model_version   TEXT    -- e.g. "llama3.2:3b"
+safety_version  TEXT    -- e.g. "keyword-v1"
 ```
 
-Dimensions such as `model_version` and `safety_version` allow before/after comparison when deploying new models or safety rules.
-
-### 4.7 Database Migrations
-
-* Use a **versioned migration strategy** (e.g. SQL migration files or a tool like Alembic) from Phase 2 onward.
-* All schema changes are applied via migrations; no ad-hoc DDL in production.
+### 4.8 Migrations
+All schema changes applied via Alembic versioned migrations. No ad-hoc DDL in production.
 
 ---
 
 ## 5. Context Management Strategy (RAT-Safe)
 
 ### Problem
-
-Passing full chat history to an LLM:
-
-* Increases hallucination risk
-* Leaks sensitive data
-* Is cost-inefficient
+Passing full chat history to the local LLM:
+- Increases hallucination risk (older models especially)
+- Is slow and memory-intensive with local inference
+- Leaks sensitive details across unrelated conversation turns
 
 ### Solution: Summarized Context Memory
 
-Each chat maintains a **rolling, sanitized summary** updated periodically.
+Each chat maintains a rolling, sanitized summary stored in `chat_context`.
 
-#### Context Types
+**Context types:**
+- `medical_facts_summary` — Symptoms, durations, stated conditions
+- `user_preferences_summary` — Communication style, preferred remedies
+- `risk_flags` — Emergency indicators, uncertainty signals
 
-* **Medical Facts Summary**: Symptoms, durations, constraints
-* **User Preferences**: Lifestyle choices, communication preferences
-* **Risk Flags**: Emergency symptoms, uncertainty indicators
+**Example safe summary:**
+> "User reports mild fever and sore throat for 2 days. No emergency symptoms. Prefers home remedies over medication."
 
-#### Example Safe Summary
+This summary is generated internally, never shown to the user, and never exposed as chain-of-thought.
 
-> "User reports mild fever and sore throat for 2 days. No emergency symptoms reported. Prefers home remedies."
+### Update Policy
+- **Trigger:** Every 5 messages OR when accumulated tokens exceed 800
+- **Max context size:** 1000 tokens (combined summary sent to model)
+- **Re-summarization:** Triggered on version drift or manually; bumps `chat_context.version`
 
-This summary is:
-
-* Generated internally
-* Never shown to the user
-* Never exposed as chain-of-thought
-
-### Context Update Policy
-
-* **When to update:** Define explicitly (e.g. every N messages, or every N tokens, or on a time window). Document the chosen policy to control cost and latency.
-* **Size limit:** Define a **maximum token/character limit** for the combined summary so RAT prompts stay bounded and cost is predictable.
-* **Re-summarization:** On version/drift detection or on a schedule, re-summarize from the last N messages and bump `chat_context.version`.
-
-### Sanitization Rules
-
-Document what is **stripped or generalized** before writing to the summary so the "safe summary" is well-defined and auditable, for example:
-
-* **PII:** No emails, names, or identifiers.
-* **Dates:** Only relative (e.g. "2 days ago") or coarse ranges; no exact calendar dates.
-* **Quotes:** No verbatim user quotes that could re-identify; paraphrase only.
+### Sanitization Rules (enforced before writing to summary)
+| Data type | Rule |
+|---|---|
+| Email / phone / name | Strip entirely |
+| Exact dates | Convert to relative ("2 days ago", "last week") |
+| Verbatim user quotes | Paraphrase only — no direct quotes |
+| Specific dosages mentioned | Generalize ("user mentioned a medication") |
 
 ---
 
 ## 6. Safety & Policy Layer
 
 ### Safety Flow
-
 ```
 User Message
-   ↓
-Safety Classifier
-   ↓
-Allowed → Context Builder → RAT
-Flagged → Safe Response Template (+ optional internal alert / external referral)
+    ↓
+Safety Classifier (keyword rules → v1; LLM-based → v3)
+    ↓
+Allowed ──────────────→ Context Builder → RAT Reasoner → Response
+    ↓ flagged
+Canned Safe Response
+    + log to safety_events
+    + escalation if policy requires
 ```
 
+### Classifier Resilience
+- Hard timeout: **2 seconds** on classifier call
+- On timeout or error → canned fallback ("I'm having trouble processing this right now")
+- Log `event_type: "classifier_error"` to `safety_events`
+- Do NOT call the model if classifier fails
+
 ### Explicit Emergency Path
-
-* **Single emergency branch:** Emergency symptoms → (1) immediate canned response to user, (2) log to `safety_events` with appropriate `event_type` and `severity`, (3) optional internal alert, (4) optional `escalation_status` (e.g. `external_referral`) when policy requires.
-* Document this path in the Safety Flow so all implementations follow the same behavior.
-
-### Escalation
-
-* **safety_events.escalation_status:** Values such as `none`, `internal_alert`, `external_referral`.
-* Define in policy **when** human review or external referral is triggered (e.g. self-harm signals, certain emergency types) and ensure it is logged and, if needed, acted upon.
+1. Emergency keywords detected → immediate canned response (e.g. "Please call emergency services")
+2. Log to `safety_events` with `severity: "critical"`, `event_type: "emergency"`
+3. Set `escalation_status: "external_referral"` if self-harm signal present
+4. No model call is made
 
 ### Safety Scenarios
+| Scenario | Handling |
+|---|---|
+| Emergency symptoms (chest pain, difficulty breathing etc.) | Immediate referral response + critical log |
+| Self-harm signals | Supportive, non-diagnostic + escalation |
+| Medication dosage request | High-level only; **never specific dosage**; recommend prescriber |
+| Prompt injection attempt | System isolation; canned response; no model call |
+| Classifier timeout / error | Canned fallback; log event |
 
-| Scenario           | Handling                            |
-| ------------------ | ----------------------------------- |
-| Emergency symptoms | Immediate referral response + log + optional escalation |
-| Self-harm signals  | Supportive, non-diagnostic response + escalation as per policy |
-| Medication dosage  | High-level guidance only; **never output specific dosage**; always recommend consulting prescriber/pharmacist |
-| Prompt injection   | System isolation (canned response, no model call) |
-
-### Medication Rule
-
-* **Hard rule:** Never output specific dosage in the product. All medication-related answers are high-level only (e.g. "Talk to your doctor or pharmacist about dosing"). Enforce via system prompt and safety spec.
+### Rate Limits
+| Endpoint | Limit |
+|---|---|
+| Auth endpoints | 10 req/min per IP |
+| `POST /v1/chats/{id}/message` | 20 req/min per user |
+| Safety classifier (internal) | 50 req/min budget |
 
 ---
 
 ## 7. RAT Reasoning Design
 
-### Why RAT Instead of RAG?
+### Why RAT (not standard RAG)?
 
-| Aspect             | RAG          | RAT    |
-| ------------------ | ------------ | ------ |
-| Chain-of-thought   | Often leaked | Hidden |
-| Health suitability | Risky        | Safer  |
-| Control            | Low          | High   |
+| Aspect | Standard RAG | RAT |
+|---|---|---|
+| Chain-of-thought | Often leaked to user | Hidden internally |
+| Retrieved docs | Passed raw to model | Summarized only |
+| Health suitability | Risky | Safer |
 
-### Retrieval Clarification
+### v1 — Summarized Context Only (No External Retrieval)
 
-* **Current scope:** The RAT reasoner uses **summarized context only** (no retrieval from an external knowledge base in the initial design).
-* **If retrieval is added later:** Only a **summary** (or selected, sanitized facts) of retrieved content is injected into context—**never raw retrieved chunks** in user-visible or chain-of-thought form—to keep the system RAT-safe.
-
-### RAT Prompting Strategy (Hidden System Prompt)
-
+The model receives:
 ```
-Use the provided summarized context as background only.
-Do not assume facts not present.
-Verify all health-related claims internally.
-Produce a clear, cautious final answer.
+SYSTEM PROMPT (hidden):
+  You are a cautious health information assistant.
+  Use only the context summary below as background. Do not assume facts not present.
+  Never provide a diagnosis. Never output specific medication dosages.
+  If uncertain, say so clearly.
+  Always recommend consulting a qualified healthcare professional.
+  Respond ONLY with a JSON object in this format:
+  {
+    "answer": "<your response>",
+    "confidence": "low|medium|high",
+    "disclaimer": "This is for informational purposes only. Please consult a healthcare professional."
+  }
+
+CONTEXT SUMMARY:
+  {sanitized_summary}
+
+USER MESSAGE:
+  {current_message}
 ```
 
-The LLM never sees:
+The model never sees: full message history, previous reasoning steps, or raw retrieved documents.
 
-* Full message history
-* Raw retrieved documents (if any)
-* Previous reasoning steps
+### v2 — Retrieval (Planned, Not in Scope)
+Candidate sources (open-access, no licensing cost):
+- WHO guidelines (who.int)
+- NHS Inform (nhsinform.scot)
+- MedlinePlus (medlineplus.gov)
 
-### Structured Output (Optional but Recommended)
+When added: only sanitized fact summaries will be injected — never raw document chunks.
 
-* Consider having the model return a **structured payload** (e.g. JSON) with fields such as:
-  * `answer` — user-visible text
-  * `confidence` — optional, for internal metrics
-  * `citations` — optional, if retrieval is added later (references only, no raw chunks)
-  * `disclaimer` — e.g. "This is not medical advice"
-* The API then renders the `answer` and appends the `disclaimer` consistently, improving control and consistency.
+### Structured Output Parsing
+```python
+# Expected model output (JSON):
+{
+  "answer": "string",
+  "confidence": "low | medium | high",
+  "disclaimer": "This is for informational purposes only..."
+}
+```
+If the model returns malformed JSON (common with smaller models):
+- Attempt regex extraction of an `answer` field
+- Fall back to treating entire response as the answer
+- Append standard disclaimer regardless
+- Log a `metric_name: "json_parse_failure"` event
 
 ---
 
-## 8. API Design (FastAPI)
+## 8. Streaming (SSE)
 
-See **[API_SPEC.md](./API_SPEC.md)** for full details. Summary below.
-
-### Versioning
-
-* **Path versioning** from day one: e.g. `/v1/auth/...`, `/v1/chats/...`.
-* Prevents breaking existing clients when the API evolves.
-
-### Authentication
+For `GET /v1/chats/{chat_id}/stream`:
+- Accept `?message=<encoded>` query param OR prior POST creates a pending stream
+- Call Ollama with `stream: true` → receives NDJSON chunks
+- Re-emit each token as an SSE event to the client
+- Emit a final `data: [DONE]` event on completion
+- SSE is unidirectional and HTTP-native — no WebSocket complexity
 
 ```
-POST /v1/auth/register
-POST /v1/auth/login
-```
-
-* **Token strategy:** Short-lived **access JWT** + **refresh token**. Document storage (e.g. httpOnly cookie or secure client store), rotation, and revocation. Refresh token endpoint: e.g. `POST /v1/auth/refresh`.
-
-### Chat Management
-
-```
-POST   /v1/chats
-GET    /v1/chats              (paginated)
-GET    /v1/chats/{chat_id}
-POST   /v1/chats/{chat_id}/message   (supports Idempotency-Key)
-GET    /v1/chats/{chat_id}/messages  (paginated)
-DELETE /v1/chats/{chat_id}
-```
-
-### Error Format
-
-* **Standard envelope:** e.g. `{ "error": { "code": "...", "message": "...", "details": {} } }`.
-* **HTTP status:** Use 429 for rate limit, 503 for model/safety service unavailable, 4xx for client errors, 5xx for server errors.
-
-### Pagination
-
-* **GET /v1/chats** and **GET /v1/chats/{chat_id}/messages:** Define **cursor-based or offset-based** pagination and a **maximum page size** (e.g. 50). Document query params (e.g. `cursor`, `limit`).
-
-### Rate Limiting
-
-* **Per user** (and optionally per IP): Document in design and in API spec. Protects the RAT/model and prevents abuse. Return 429 when exceeded.
-
-### Message Handling (Pseudo-code)
-
-```python
-def send_message(chat_id, user_msg, user, idempotency_key=None):
-    if idempotency_key and duplicate_exists(chat_id, idempotency_key):
-        return get_existing_response(chat_id, idempotency_key)
-
-    summary = get_safe_summary(chat_id)
-
-    if is_flagged(user_msg):
-        response = safe_override_response()
-        log_safety_event(chat_id, ...)
-        return response
-
-    response = rat_reason(
-        user_input=user_msg,
-        context_summary=summary
-    )
-
-    save_message(chat_id, "user", user_msg)
-    save_message(chat_id, "assistant", response, idempotency_key=idempotency_key)
-
-    update_safe_summary(chat_id, user_msg, response)
-
-    return response
+Client  →  GET /v1/chats/{id}/stream
+Server  →  text/event-stream
+           data: {"token": "Based"}
+           data: {"token": " on"}
+           data: {"token": " your"}
+           ...
+           data: [DONE]
 ```
 
 ---
 
 ## 9. Authentication & Security
 
-* **Secrets:** Model API keys, database credentials, and JWT signing secrets are stored in a **secrets manager** (e.g. HashiCorp Vault, cloud provider secret manager). Never committed in repo or plain env files.
-* **Audit logging:** All access to chats/messages (read/write) and all safety overrides are written to an **append-only audit log** (tamper-evident where feasible) for compliance and forensics.
+- **Access JWT:** 15 minutes TTL; signed with `JWT_SECRET` from env/secrets manager
+- **Refresh token:** 7-day TTL; stored in `httpOnly`, `Secure`, `SameSite=Strict` cookie
+- **Refresh endpoint:** `POST /v1/auth/refresh` — validates cookie, issues new access JWT
+- **Logout:** clears refresh cookie server-side
+- **Secrets management:** All secrets (DB URL, JWT secret) in `.env`; never committed. Production uses a secrets manager (e.g. Railway env vars, Vault)
+- **Audit logging:** All chat access (read/write) and safety overrides logged to append-only `safety_events`
 
 ---
 
 ## 10. Compliance & Privacy
 
-* **Data minimization:** Only data necessary for the product is stored. No raw logs of full prompts/responses beyond what is in `messages` and `safety_events` (and any approved audit records).
-* **Retention:** `chats.expires_at` is tied to a **retention policy** (e.g. 90 days). Automated deletion or anonymization is run periodically; document in risk analysis and runbooks.
-* **Regulatory alignment:**
-  * **US (HIPAA):** If handling PHI, plan for BAA with model/provider, encryption at rest and in transit, access controls, and audit logging. Call out in roadmap (e.g. Phase 2 or 3).
-  * **EU (GDPR):** Legal basis for processing, data subject rights (access, deletion, portability), and DPAs with sub-processors. Document retention and deletion in privacy notice.
+- **Data minimization:** Only what is needed is stored. No raw LLM prompt/response logs beyond `messages` and `safety_events`
+- **Retention:** `chats.expires_at` = 90 days from creation. Automated deletion job runs nightly
+- **Local inference = no third-party AI processor** — eliminates the largest GDPR/HIPAA data-processor concern
+- **HIPAA (US):** If PHI is involved, add encryption at rest (Postgres column-level or disk encryption), TLS in transit, access controls. Document in Phase 3
+- **GDPR:** Legal basis for processing, data subject deletion right (`DELETE /v1/chats/{id}` + account deletion endpoint in Phase 3), DPA not required for Ollama (local)
 
 ---
 
 ## 11. Evaluation & Monitoring
 
-### Metrics Tracked
+### Metrics
+| Metric | How measured |
+|---|---|
+| Hallucination rate | Sample-based review against golden Q&A set |
+| Safety override rate | `safety_events` count / total messages |
+| Context drift | `chat_context.version` increment frequency |
+| JSON parse failure rate | Logged to `model_metrics` |
+| Avg response latency | Middleware timing → `model_metrics` |
 
-| Metric               | Purpose           |
-| -------------------- | ----------------- |
-| Hallucination rate   | Reliability       |
-| Safety override rate | Guardrail quality |
-| Context drift        | Memory accuracy   |
-| Response consistency | Clinical safety   |
-
-* **Hallucination rate:** Define the **method** (e.g. sample-based human review, or model-based checks against a golden Q&A set) so the metric is implementable.
-
-### SLOs (Service Level Objectives)
-
-* Define at least one or two SLOs, e.g.:
-  * p95 latency for `send_message` &lt; X seconds
-  * Safety override rate within expected band (e.g. &lt; Y% or alert if &gt; Z%)
-* Document where these are monitored (e.g. dashboard, alerting).
-
-### Metrics Table
-
-See **4.6 Model Metrics Table** — include `model_version` and `safety_version` for comparability.
+### SLOs
+- p95 `POST /message` latency < 10s (local model; hardware-dependent)
+- Safety override rate < 5% of messages in normal use
+- Classifier error rate < 0.5%
 
 ---
 
 ## 12. Failure & Risk Analysis
 
-| Risk                     | Mitigation |
-| ------------------------ | ---------- |
-| Hallucinated advice      | Strict prompts + summarized context only |
-| Context corruption       | Periodic re-summarization; version in `chat_context` |
-| Token leakage            | JWT expiry; refresh token rotation |
-| Data over-retention      | Auto-expiry; retention policy; automated deletion |
-| Model/safety service down| Fallback: "Sorry, I can't process this right now"; do not store user message until service is back |
-| Summary corruption / stuck context | Periodic re-summarization from last N messages; version check |
-| Abuse / prompt injection | Rate limiting, input length limits, safety classifier → system isolation response |
+| Risk | Mitigation |
+|---|---|
+| Hallucinated advice | Strict system prompt + summarized context only + confidence field |
+| Ollama model not running | `GET /ready` checks Ollama ping; return 503 if down |
+| Small model bad JSON output | JSON parse fallback + disclaimer always appended |
+| Context corruption | Periodic re-summarization; version in `chat_context` |
+| Token leakage | JWT expiry; refresh rotation; httpOnly cookie |
+| Data over-retention | Auto-expiry; `expires_at`; nightly deletion job |
+| Abuse / prompt injection | Rate limiting + input length cap (1000 chars) + keyword classifier |
+| Summary stuck / corrupt | Re-summarize from last N messages on version mismatch |
+| Model swap breaks output format | JSON parse fallback; model version logged in metrics |
 
 ---
 
-## 13. Optional Enhancements
+## 13. Implementation Roadmap
 
-* **Feature flags:** Toggle safety rules, model version, or context strategy without redeploy (e.g. for A/B testing or rollback).
-* **Admin API:** Read-only or tightly scoped admin endpoints (e.g. list `safety_events`, export for audit), behind a separate admin role and auth.
+### Phase 1 — Architecture ✅ Complete
+- System design, DB schema, safety planning, API spec, RAT design, compliance notes
 
----
+### Phase 2 — Backend 🔧 In Progress
+- FastAPI project setup + Alembic migrations
+- Auth (register, login, refresh, logout, consent)
+- Chat CRUD + auto-title generation
+- Message endpoint (idempotency, safety stub, RAT stub returning placeholder)
+- SSE streaming endpoint
+- Real RAT: Ollama integration + structured output parser
+- Real safety classifier: keyword rules
+- Context builder: summarization + sanitization
+- Message feedback endpoint
+- Structured JSON logging + request IDs
 
-## 14. Implementation Roadmap
+### Phase 3 — AI Layer Hardening
+- LLM-based safety classifier (replace keyword rules)
+- Red-team safety test suite (injection, roleplay bypass, dosage fishing)
+- Evaluation pipeline vs golden Q&A set
+- Confidence-threshold logic (low confidence → stronger disclaimer)
+- HIPAA alignment if needed
 
-### Phase 1 – Architecture (Completed)
-
-* System design
-* Safety planning
-* API & schema definition
-* **Design refinements:** Indexes, idempotency, context versioning, safety escalation, compliance notes, risk table, SLOs
-
-### Phase 2 – Backend
-
-* Auth & chat APIs (with versioning, errors, pagination, rate limiting)
-* Context summarizer (update policy, sanitization, size limit)
-* **Database migrations strategy** (versioned migrations)
-* **Audit logging** for chat access and safety events
-
-### Phase 3 – AI Layer
-
-* RAT reasoner (hidden CoT; optional structured output)
-* Safety classifier (emergency path, escalation, medication rule)
-* Evaluation metrics (with model/safety version dimensions)
-* **Prompt and context-summary testing** (golden datasets, red-team style safety cases)
-* **HIPAA alignment** (if US and PHI): BAA, encryption, access controls, audit
-
-### Phase 4 – Frontend
-
-* Login (and refresh token flow)
-* Chat UI
-* Chat history (paginated)
-* **Accessibility (WCAG)** and **mobile-responsive** UI
+### Phase 4 — Frontend (Loveable)
+- Login / register / consent gate
+- Chat sidebar + paginated history
+- Chat window with SSE streaming
+- Thumbs up/down feedback
+- Mobile-responsive + WCAG AA
 
 ---
 
-## 15. Conclusion
+## 14. Folder Structure (Backend)
 
-This project demonstrates a **design-first approach to building safe, scalable Health AI systems**. By prioritizing **privacy, safety, and reasoning integrity**, and by incorporating **indexing, idempotency, context versioning, explicit safety escalation, API versioning, rate limiting, compliance alignment, and SLOs**, the architecture is production-ready and provides a strong foundation for implementation.
+```
+health-ai-backend/
+├── app/
+│   ├── main.py              # FastAPI app + middleware registration
+│   ├── config.py            # Settings from env (pydantic-settings)
+│   ├── database.py          # Async SQLAlchemy engine + session
+│   ├── middleware/
+│   │   ├── auth.py          # JWT verification dependency
+│   │   └── request_id.py    # Inject X-Request-ID header
+│   ├── routers/
+│   │   ├── auth.py          # /v1/auth/* + /v1/users/consent
+│   │   ├── chats.py         # /v1/chats/*
+│   │   ├── messages.py      # /v1/chats/{id}/message + /stream + feedback
+│   │   └── ops.py           # /health + /ready
+│   ├── services/
+│   │   ├── context.py       # Context builder, summarizer, sanitizer
+│   │   ├── safety.py        # Classifier, emergency path, escalation
+│   │   ├── rat.py           # RAT reasoner → Ollama call + output parser
+│   │   └── titles.py        # Auto-title generation from first message
+│   ├── models/
+│   │   └── db.py            # SQLAlchemy ORM models
+│   └── schemas/
+│       └── api.py           # Pydantic request/response schemas
+├── migrations/
+│   └── versions/
+├── tests/
+│   ├── unit/                # Safety classifier, context sanitizer, JSON parser
+│   └── integration/         # Auth flow, chat CRUD, message flow, SSE
+├── .env.example
+├── alembic.ini
+└── requirements.txt
+```
 
 ---
 
-## 16. Repository Usage
+## 15. Key Decisions
 
-This repository serves as:
-
-* A reference architecture for Health AI systems
-* A foundation for future development
-* A demonstration of AI systems thinking and safety-aware design
+| Decision | Choice | Reason |
+|---|---|---|
+| AI inference | Ollama (local) | Zero cost; maximum privacy; no external data processor |
+| Refresh token storage | httpOnly cookie | Prevents JS access; standard for web clients |
+| Response delivery | SSE | Simpler than WebSocket for unidirectional streaming |
+| Context update trigger | Every 5 messages OR >800 tokens | Balances freshness vs local inference cost |
+| Max context size | 1000 tokens | Keeps prompts bounded for smaller local models |
+| Chat title | Auto-generated from first message; user-editable | Best UX default |
+| v1 retrieval | None — summarized context only | Tight scope; retrieval is Phase 3 |
+| Recommended dev model | `llama3.2:3b` | Fast on low RAM; swap via env var |
